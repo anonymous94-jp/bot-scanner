@@ -1,7 +1,8 @@
 
 const {
     getSpotUsdtSymbols,
-    getSpotKlines
+    getSpotKlines,
+    getSpot24hrTickers
 } = require("./binanceService");
 
 const { analyzeKlines } = require("./indicatorService");
@@ -13,6 +14,44 @@ const CONCURRENCY = 5;
 const KLINE_LIMIT = 100;
 const MAX_RETRIES = 3;
 const REQUEST_GAP_MS = 100;
+
+const APPEARANCE_WINDOW_MS = 4 * 60 * 60 * 1000;
+
+// Map<symbol, timestamp[]>
+const appearanceHistory = new Map();
+
+function updateAppearanceCounts(matches, recordThisScan) {
+    const now = Date.now();
+    const cutoff = now - APPEARANCE_WINDOW_MS;
+
+    // Xóa những lần xuất hiện đã quá 4 giờ.
+    for (const [symbol, timestamps] of appearanceHistory) {
+        const recent = timestamps.filter(ts => ts > cutoff);
+
+        if (recent.length > 0) {
+            appearanceHistory.set(symbol, recent);
+        } else {
+            appearanceHistory.delete(symbol);
+        }
+    }
+
+    // Chỉ cộng khi lượt quét không bị dừng giữa chừng.
+    if (recordThisScan) {
+        for (const item of matches) {
+            const timestamps =
+                appearanceHistory.get(item.symbol) || [];
+
+            timestamps.push(now);
+            appearanceHistory.set(item.symbol, timestamps);
+        }
+    }
+
+    // Gắn số lần xuất hiện vào kết quả để terminal và Telegram dùng chung.
+    for (const item of matches) {
+        item.appear4h =
+            appearanceHistory.get(item.symbol)?.length ?? 0;
+    }
+}
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -143,6 +182,7 @@ async function scanAllSpotUsdt(options = {}) {
     });
 
     let symbols;
+    let tickers;
 
     try {
         // Request lấy danh sách symbol cũng phải tuân theo rate limit.
@@ -153,6 +193,9 @@ async function scanAllSpotUsdt(options = {}) {
                 description: "Lấy danh sách Spot USDT"
             }
         );
+
+        tickers = await getSpot24hrTickers();
+
     } catch (error) {
         logger.error("Không thể lấy danh sách Spot USDT", {
             message: error.message,
@@ -202,6 +245,13 @@ async function scanAllSpotUsdt(options = {}) {
                 const result = await scanOneSymbol(symbol, {
                     coordinator
                 });
+
+                const ticker = tickers.get(symbol);
+
+                if (ticker) {
+                    result.currentPrice = ticker.currentPrice;
+                    result.change24hPct = ticker.change24hPct;
+                }
 
                 if (
                     Number.isFinite(result.volRatio) &&
@@ -270,6 +320,8 @@ async function scanAllSpotUsdt(options = {}) {
     const elapsedSeconds = (Date.now() - startedAt) / 1000;
     const stopped = coordinator.isStopped();
 
+    updateAppearanceCounts(matches, !stopped);
+
     logger.info("Kết thúc lượt quét", {
         totalSymbols: symbols.length,
         completed,
@@ -304,9 +356,10 @@ async function scanAllSpotUsdt(options = {}) {
                 DistanceEMA50: item.priceVsEma50Pct == null
                     ? "N/A"
                     : `${item.priceVsEma50Pct.toFixed(3)}%`,
-                Change15m: item.change15mPct == null
+                Change24h: item.change24hPct == null
                     ? "N/A"
-                    : `${item.change15mPct.toFixed(3)}%`
+                    : `${item.change24hPct.toFixed(3)}%`,
+                Appear4h: item.appear4h ?? 0,
             }))
         );
     } else {

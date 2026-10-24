@@ -81,7 +81,8 @@ function buildTokenLine(token) {
         `RSI: ${formatNumber(token.rsi14, 5)}`,
         `EMA20: ${formatNumber(token.priceVsEma20Pct)}%`,
         `EMA50: ${formatNumber(token.priceVsEma50Pct)}%`,
-        `15m: ${formatPercent(token.change15mPct)}`
+        `24h: ${formatPercent(token.change24hPct)}`,
+        `Appear4h: <b>${token.appear4h ?? 0}</b>`
     ].join(" | ");
 }
 

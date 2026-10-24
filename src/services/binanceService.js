@@ -236,6 +236,28 @@ async function getFuturesPrice(symbol) {
     return Number(response.data.price);
 }
 
+async function getSpot24hrTickers() {
+    const url = `${SPOT_BASE_URL}/api/v3/ticker/24hr`;
+
+    try {
+        const response = await http.get(url);
+
+        return new Map(
+            response.data.map(item => [
+                item.symbol,
+                {
+                    currentPrice: Number(item.lastPrice),
+                    change24hPct: Number(item.priceChangePercent)
+                }
+            ])
+        );
+    } catch (error) {
+        throw new Error(
+            `Không lấy được ticker 24h: ${getErrorMessage(error)}`
+        );
+    }
+}
+
 function normalizeSymbol(symbol) {
     return String(symbol).trim().toUpperCase();
 }
@@ -245,5 +267,6 @@ module.exports = {
     getSpotPrice,
     getSpotKlines,
     getFuturesPairInfo,
-    getFuturesPrice
+    getFuturesPrice,
+    getSpot24hrTickers
 };

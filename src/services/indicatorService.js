@@ -105,7 +105,13 @@ function analyzeKlines(klines, options = {}) {
 
     // Giá đóng cửa hiện tại so với giá đóng cửa cách 15 phút.
     // Với nến 5m: so sánh nến cuối và nến cách 3 vị trí.
-    const reference = candles[candles.length - 4];
+    // const reference = candles[candles.length - 4];
+
+    // const change15mPct = reference && reference.close !== 0
+    //     ? ((last.close - reference.close) / reference.close) * 100
+    //     : null;
+    // Với nến 15m: so sánh nến cuối và nến cách 1 vị trí.
+    const reference = candles[candles.length - 2];
 
     const change15mPct = reference && reference.close !== 0
         ? ((last.close - reference.close) / reference.close) * 100
@@ -125,7 +131,7 @@ function analyzeKlines(klines, options = {}) {
 
     return {
         symbol: options.symbol ?? null,
-        interval: options.interval ?? "5m",
+        interval: options.interval ?? "15m",
         candleCloseTime: last.closeTime,
         closePrice: last.close,
         currentPrice: options.currentPrice ?? null,

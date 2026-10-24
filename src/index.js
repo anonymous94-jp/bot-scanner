@@ -1,4 +1,3 @@
-
 const {
     getSpotPrice,
     getSpotKlines,
@@ -10,9 +9,11 @@ const {
     analyzeKlines
 } = require("./services/indicatorService");
 
-async function main() {
-    const symbol = (process.argv[2] || "SOLUSDT").toUpperCase();
+const {
+    scanAllSpotUsdt
+} = require("./services/scannerService");
 
+async function scanSingleSymbol(symbol) {
     console.log(`\nĐang kiểm tra ${symbol}...\n`);
 
     const [currentPrice, klines] = await Promise.all([
@@ -33,12 +34,10 @@ async function main() {
     console.log(`VolRatio:       ${result.volRatio?.toFixed(2)}x`);
     console.log(`RSI(14):        ${result.rsi14?.toFixed(2)}`);
     console.log(`EMA20:          ${result.ema20?.toFixed(8)}`);
-    console.log(`Distance EMA20: ${result.priceVsEma20Pct.toFixed(3)}%`);
+    console.log(`Distance EMA20: ${result.priceVsEma20Pct?.toFixed(3)}%`);
     console.log(`EMA50:          ${result.ema50?.toFixed(8)}`);
-    console.log(`Distance EMA50: ${result.priceVsEma50Pct.toFixed(3)}%`);
-    console.log(
-        `Change 15m:     ${result.change15mPct?.toFixed(2)}%`
-    );
+    console.log(`Distance EMA50: ${result.priceVsEma50Pct?.toFixed(3)}%`);
+    console.log(`Change 15m:     ${result.change15mPct?.toFixed(2)}%`);
     console.log(`Price vs EMA20: ${result.priceVsEma20}`);
     console.log(`EMA trend:      ${result.trend}`);
 
@@ -55,7 +54,26 @@ async function main() {
     }
 }
 
+async function main() {
+    const arg = process.argv[2];
+
+    if (arg?.toLowerCase() === "--all") {
+        console.log("\nChế độ: QUÉT TOÀN BỘ BINANCE SPOT USDT\n");
+
+        await scanAllSpotUsdt({
+            threshold: 2,
+            concurrency: 5
+        });
+
+        return;
+    }
+
+    const symbol = (arg || "SOLUSDT").toUpperCase();
+
+    await scanSingleSymbol(symbol);
+}
+
 main().catch(error => {
-    console.error("\nKiểm tra thất bại:", error.message);
+    console.error("\nChương trình thất bại:", error.message);
     process.exitCode = 1;
 });

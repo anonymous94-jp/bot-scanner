@@ -5,67 +5,117 @@ const {
 } = require("./binanceService");
 
 const { analyzeKlines } = require("./indicatorService");
+const logger = require("./logger");
+const { createRateLimitCoordinator } = require("./rateLimitCoordinator");
 
 const VOL_RATIO_THRESHOLD = 2;
 const CONCURRENCY = 5;
 const KLINE_LIMIT = 100;
 const MAX_RETRIES = 3;
+const REQUEST_GAP_MS = 100;
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function isRetryableError(error) {
-    const message = error.message || "";
+    const status = error.status;
 
-    return /HTTP (418|429|5\d\d)/.test(message) ||
-        /timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN/i.test(message);
+    return status === 418 ||
+        status === 429 ||
+        (Number.isInteger(status) && status >= 500 && status <= 599) ||
+        /timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/i
+            .test(`${error.code || ""} ${error.message || ""}`);
 }
 
-async function getKlinesWithRetry(symbol) {
+/**
+ * Mọi request trong lượt quét phải đi qua hàm này.
+ * Rate limit được điều phối chung cho tất cả worker.
+ */
+
+async function requestWithRetry(
+    operation,
+    { coordinator, description, symbol = null }
+) {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        await coordinator.waitUntilAllowed();
+
         try {
-            return await getSpotKlines(symbol, "5m", KLINE_LIMIT);
+            return await operation();
         } catch (error) {
-            if (
-                attempt === MAX_RETRIES ||
-                !isRetryableError(error)
-            ) {
+            const retryable = isRetryableError(error);
+            const isRateLimit =
+                error.status === 418 || error.status === 429;
+
+            // Luôn báo coordinator trước khi quyết định dừng retry,
+            // kể cả khi đây là lần thử cuối cùng.
+            if (isRateLimit) {
+                coordinator.block(error);
+
+                if (coordinator.isStopped()) {
+                    throw error;
+                }
+            }
+
+            if (!retryable || attempt >= MAX_RETRIES) {
                 throw error;
             }
 
-            const message = error.message || "";
+            if (isRateLimit) {
+                logger.warn("Request sẽ thử lại sau khi rate limit được xử lý", {
+                    description,
+                    symbol,
+                    status: error.status,
+                    attempt: attempt + 1,
+                    maxRetries: MAX_RETRIES,
+                    retryAfter: error.retryAfter ?? null
+                });
 
-            // Binance 418: IP có thể đang bị hạn chế.
-            // Tạm dừng lâu hơn thay vì tiếp tục gửi request dồn dập.
-            const delay = /HTTP 418/.test(message)
-                ? 60_000
-                : /HTTP 429/.test(message)
-                    ? 10_000 * (attempt + 1)
-                    : 2_000 * (2 ** attempt);
+                // Vòng lặp kế tiếp sẽ chờ coordinator.
+                continue;
+            }
 
-            console.warn(
-                `[RETRY] ${symbol}: ${message}. ` +
-                `Thử lại sau ${delay / 1000}s ` +
-                `(${attempt + 1}/${MAX_RETRIES})`
+            const delay = Math.min(
+                2000 * (2 ** attempt),
+                30000
             );
+
+            logger.warn("Request gặp lỗi tạm thời, sẽ thử lại", {
+                description,
+                symbol,
+                status: error.status ?? null,
+                code: error.code ?? null,
+                attempt: attempt + 1,
+                maxRetries: MAX_RETRIES,
+                delayMs: delay,
+                message: error.message
+            });
 
             await sleep(delay);
         }
     }
 
-    throw new Error(`Không lấy được dữ liệu ${symbol}`);
+    throw new Error(`Đã hết số lần thử: ${description}`);
 }
 
-async function scanOneSymbol(symbol) {
-    const klines = await getKlinesWithRetry(symbol);
 
-    const analysis = analyzeKlines(klines, {
+async function scanOneSymbol(symbol, options = {}) {
+    const coordinator = options.coordinator ||
+        createRateLimitCoordinator();
+
+    const klines = await requestWithRetry(
+        () => getSpotKlines(symbol, "15m", KLINE_LIMIT),
+        {
+            coordinator,
+            description: "Lấy nến Spot",
+            symbol
+        }
+    );
+
+    return analyzeKlines(klines, {
         symbol,
-        interval: "5m"
+        interval: "15m"
     });
-
-    return analysis;
 }
 
 async function scanAllSpotUsdt(options = {}) {
@@ -82,14 +132,43 @@ async function scanAllSpotUsdt(options = {}) {
         throw new Error("concurrency phải là số nguyên từ 1 đến 10");
     }
 
-    console.log("Đang lấy danh sách Binance Spot USDT...");
+    const coordinator = createRateLimitCoordinator();
+    const startedAt = Date.now();
 
-    const symbols = await getSpotUsdtSymbols();
+    logger.info("Bắt đầu lượt quét Binance Spot USDT", {
+        threshold,
+        concurrency,
+        klineLimit: KLINE_LIMIT,
+        interval: "5m"
+    });
 
-    console.log(`Tìm thấy ${symbols.length} cặp Spot USDT.`);
-    console.log(`Concurrency: ${concurrency}`);
-    console.log(`Điều kiện VolRatio >= ${threshold}x`);
-    console.log("Bắt đầu quét...\n");
+    let symbols;
+
+    try {
+        // Request lấy danh sách symbol cũng phải tuân theo rate limit.
+        symbols = await requestWithRetry(
+            () => getSpotUsdtSymbols(),
+            {
+                coordinator,
+                description: "Lấy danh sách Spot USDT"
+            }
+        );
+    } catch (error) {
+        logger.error("Không thể lấy danh sách Spot USDT", {
+            message: error.message,
+            status: error.status ?? null,
+            code: error.code ?? null,
+            endpoint: error.endpoint ?? null
+        });
+
+        throw error;
+    }
+
+    logger.info("Đã lấy danh sách Spot USDT", {
+        totalSymbols: symbols.length,
+        threshold,
+        concurrency
+    });
 
     const matches = [];
     const errors = [];
@@ -99,6 +178,18 @@ async function scanAllSpotUsdt(options = {}) {
 
     async function worker() {
         while (true) {
+            try {
+                // Bảo đảm worker không lấy công việc mới
+                // khi đang có lệnh tạm dừng toàn cục.
+                await coordinator.waitUntilAllowed();
+            } catch (error) {
+                if (coordinator.isStopped()) {
+                    return;
+                }
+
+                throw error;
+            }
+
             const index = nextIndex++;
 
             if (index >= symbols.length) {
@@ -108,19 +199,45 @@ async function scanAllSpotUsdt(options = {}) {
             const symbol = symbols[index];
 
             try {
-                const result = await scanOneSymbol(symbol);
+                const result = await scanOneSymbol(symbol, {
+                    coordinator
+                });
 
                 if (
                     Number.isFinite(result.volRatio) &&
                     result.volRatio >= threshold
                 ) {
                     matches.push(result);
+
+                    logger.info("Symbol đạt điều kiện VolRatio", {
+                        symbol,
+                        volRatio: result.volRatio,
+                        threshold,
+                        rsi14: result.rsi14,
+                        change15mPct: result.change15mPct
+                    });
                 }
             } catch (error) {
                 errors.push({
                     symbol,
+                    status: error.status ?? null,
+                    code: error.code ?? null,
                     message: error.message
                 });
+
+                logger.error("Phân tích symbol thất bại", {
+                    symbol,
+                    status: error.status ?? null,
+                    code: error.code ?? null,
+                    endpoint: error.endpoint ?? null,
+                    message: error.message
+                });
+
+                // Không tiếp tục nhận công việc mới nếu scanner
+                // đã bị dừng an toàn do HTTP 418 không có Retry-After.
+                if (coordinator.isStopped()) {
+                    return;
+                }
             }
 
             completed++;
@@ -129,19 +246,17 @@ async function scanAllSpotUsdt(options = {}) {
                 completed % 50 === 0 ||
                 completed === symbols.length
             ) {
-                console.log(
-                    `Tiến độ: ${completed}/${symbols.length} | ` +
-                    `Đạt điều kiện: ${matches.length} | ` +
-                    `Lỗi: ${errors.length}`
-                );
+                logger.info("Tiến độ quét", {
+                    completed,
+                    total: symbols.length,
+                    matches: matches.length,
+                    errors: errors.length
+                });
             }
 
-            // Giãn nhẹ giữa các request của từng worker.
-            await sleep(100);
+            await sleep(REQUEST_GAP_MS);
         }
     }
-
-    const startedAt = Date.now();
 
     await Promise.all(
         Array.from(
@@ -153,6 +268,16 @@ async function scanAllSpotUsdt(options = {}) {
     matches.sort((a, b) => b.volRatio - a.volRatio);
 
     const elapsedSeconds = (Date.now() - startedAt) / 1000;
+    const stopped = coordinator.isStopped();
+
+    logger.info("Kết thúc lượt quét", {
+        totalSymbols: symbols.length,
+        completed,
+        matches: matches.length,
+        errors: errors.length,
+        elapsedSeconds: Number(elapsedSeconds.toFixed(1)),
+        stoppedByRateLimit: stopped
+    });
 
     console.log("\n========== SCAN SUMMARY ==========");
     console.log(`Tổng số cặp:       ${symbols.length}`);
@@ -160,6 +285,7 @@ async function scanAllSpotUsdt(options = {}) {
     console.log(`Đạt VolRatio:      ${matches.length}`);
     console.log(`Lỗi:               ${errors.length}`);
     console.log(`Thời gian:         ${elapsedSeconds.toFixed(1)} giây`);
+    console.log(`Dừng do rate limit: ${stopped ? "CÓ" : "KHÔNG"}`);
 
     if (matches.length > 0) {
         console.log("\n========== MATCHES ==========");
@@ -167,6 +293,7 @@ async function scanAllSpotUsdt(options = {}) {
         console.table(
             matches.map(item => ({
                 Symbol: item.symbol,
+                CurrentPrice: item.currentPrice ?? item.closePrice,
                 VolRatio: `${item.volRatio.toFixed(2)}x`,
                 RSI14: item.rsi14?.toFixed(2),
                 EMA20: item.ema20?.toFixed(8),
@@ -191,13 +318,17 @@ async function scanAllSpotUsdt(options = {}) {
         console.table(errors.slice(0, 20));
 
         if (errors.length > 20) {
-            console.log(
-                `Còn ${errors.length - 20} lỗi không hiển thị.`
-            );
+            console.log(`Còn ${errors.length - 20} lỗi không hiển thị.`);
         }
     }
 
-    return { symbols, matches, errors, elapsedSeconds };
+    return {
+        symbols,
+        matches,
+        errors,
+        elapsedSeconds,
+        stoppedByRateLimit: stopped
+    };
 }
 
 module.exports = {

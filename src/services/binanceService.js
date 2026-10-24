@@ -1,5 +1,6 @@
 
 const axios = require("axios");
+const logger = require("./logger");
 
 const SPOT_BASE_URL = "https://api.binance.com";
 const FUTURES_BASE_URL = "https://fapi.binance.com";
@@ -11,90 +12,170 @@ const http = axios.create({
     }
 });
 
+// Lấy các header liên quan đến rate limit nếu Binance cung cấp.
+function getRelevantHeaders(headers = {}) {
+    const result = {};
+
+    for (const [key, value] of Object.entries(headers)) {
+        const lowerKey = key.toLowerCase();
+
+        if (
+            lowerKey === "retry-after" ||
+            lowerKey.startsWith("x-mbx-used-weight") ||
+            lowerKey === "x-mbx-order-count-1m"
+        ) {
+            result[key] = value;
+        }
+    }
+
+    return result;
+}
+
+// Giữ thông tin lỗi gốc để scanner có thể quyết định retry,
+// tạm dừng worker và ghi log theo HTTP status.
+function normalizeApiError(error, { endpoint, symbol } = {}) {
+    const response = error.response;
+    const status = response?.status;
+    const headers = getRelevantHeaders(response?.headers);
+
+    const apiError = new Error(
+        response
+            ? `HTTP ${status}: ${JSON.stringify(response.data)}`
+            : error.message || "Lỗi không xác định"
+    );
+
+    apiError.name = "BinanceApiError";
+    apiError.status = status ?? null;
+    apiError.code = error.code ?? null;
+    apiError.endpoint = endpoint;
+    apiError.symbol = symbol ?? null;
+    apiError.headers = headers;
+    apiError.responseData = response?.data ?? null;
+    apiError.retryAfter = headers["retry-after"] ??
+        headers["Retry-After"] ??
+        null;
+
+    const details = {
+        endpoint,
+        symbol: symbol ?? null,
+        status: apiError.status,
+        code: apiError.code,
+        headers,
+        responseData: apiError.responseData,
+        retryAfter: apiError.retryAfter
+    };
+
+    if (status === 418 || status === 429) {
+        logger.rateLimit("Binance rate limit hoặc IP restriction", details);
+    } else {
+        logger.error("Binance API request thất bại", details);
+    }
+
+    return apiError;
+}
+
+async function request(config, context = {}) {
+    try {
+        const response = await http.request(config);
+
+        const headers = getRelevantHeaders(response.headers);
+
+        if (Object.keys(headers).length > 0) {
+            logger.info("Binance response headers", {
+                endpoint: context.endpoint,
+                symbol: context.symbol ?? null,
+                headers
+            });
+        }
+
+        return response;
+    } catch (error) {
+        throw normalizeApiError(error, context);
+    }
+}
+
 /**
  * Lấy danh sách cặp Spot USDT đang giao dịch.
  */
 async function getSpotUsdtSymbols() {
-    const url = `${SPOT_BASE_URL}/api/v3/exchangeInfo`;
+    const endpoint = "/api/v3/exchangeInfo";
 
-    try {
-        const response = await http.get(url);
+    const response = await request(
+        {
+            method: "GET",
+            baseURL: SPOT_BASE_URL,
+            url: endpoint
+        },
+        { endpoint }
+    );
 
-        return response.data.symbols
-            .filter(symbol =>
-                symbol.quoteAsset === "USDT" &&
-                symbol.status === "TRADING" &&
-                symbol.isSpotTradingAllowed !== false
-            )
-            .map(symbol => symbol.symbol);
-    } catch (error) {
-        throw new Error(
-            `Không lấy được danh sách Spot: ${getErrorMessage(error)}`
-        );
-    }
+    return response.data.symbols
+        .filter(symbol =>
+            symbol.quoteAsset === "USDT" &&
+            symbol.status === "TRADING" &&
+            symbol.isSpotTradingAllowed !== false
+        )
+        .map(symbol => symbol.symbol);
 }
 
 /**
- * Lấy giá Spot hiện tại của một cặp, ví dụ SOLUSDT.
+ * Lấy giá Spot hiện tại.
  */
 async function getSpotPrice(symbol) {
-    const url = `${SPOT_BASE_URL}/api/v3/ticker/price`;
+    const normalized = normalizeSymbol(symbol);
+    const endpoint = "/api/v3/ticker/price";
 
-    try {
-        const response = await http.get(url, {
-            params: { symbol: normalizeSymbol(symbol) }
-        });
+    const response = await request(
+        {
+            method: "GET",
+            baseURL: SPOT_BASE_URL,
+            url: endpoint,
+            params: { symbol: normalized }
+        },
+        { endpoint, symbol: normalized }
+    );
 
-        return Number(response.data.price);
-    } catch (error) {
-        throw new Error(
-            `Không lấy được giá Spot ${symbol}: ${getErrorMessage(error)}`
-        );
-    }
+    return Number(response.data.price);
 }
 
 /**
  * Lấy nến Spot OHLCV.
- *
- * Mỗi nến có:
- * openTime, open, high, low, close, volume,
- * closeTime, quoteVolume, trades,
- * takerBuyBaseVolume, takerBuyQuoteVolume.
  */
 async function getSpotKlines(
     symbol,
     interval = "5m",
     limit = 100
 ) {
-    const url = `${SPOT_BASE_URL}/api/v3/klines`;
+    const normalized = normalizeSymbol(symbol);
+    const endpoint = "/api/v3/klines";
 
-    try {
-        const response = await http.get(url, {
+    const response = await request(
+        {
+            method: "GET",
+            baseURL: SPOT_BASE_URL,
+            url: endpoint,
             params: {
-                symbol: normalizeSymbol(symbol),
+                symbol: normalized,
                 interval,
                 limit
             }
-        });
+        },
+        { endpoint, symbol: normalized }
+    );
 
-        return response.data.map(kline => ({
-            openTime: Number(kline[0]),
-            open: Number(kline[1]),
-            high: Number(kline[2]),
-            low: Number(kline[3]),
-            close: Number(kline[4]),
-            volume: Number(kline[5]),
-            closeTime: Number(kline[6]),
-            quoteVolume: Number(kline[7]),
-            trades: Number(kline[8]),
-            takerBuyBaseVolume: Number(kline[9]),
-            takerBuyQuoteVolume: Number(kline[10])
-        }));
-    } catch (error) {
-        throw new Error(
-            `Không lấy được nến Spot ${symbol}: ${getErrorMessage(error)}`
-        );
-    }
+    return response.data.map(kline => ({
+        openTime: Number(kline[0]),
+        open: Number(kline[1]),
+        high: Number(kline[2]),
+        low: Number(kline[3]),
+        close: Number(kline[4]),
+        volume: Number(kline[5]),
+        closeTime: Number(kline[6]),
+        quoteVolume: Number(kline[7]),
+        trades: Number(kline[8]),
+        takerBuyBaseVolume: Number(kline[9]),
+        takerBuyQuoteVolume: Number(kline[10])
+    }));
 }
 
 /**
@@ -103,35 +184,36 @@ async function getSpotKlines(
  */
 async function getFuturesPairInfo(symbol) {
     const normalized = normalizeSymbol(symbol);
-    const url = `${FUTURES_BASE_URL}/fapi/v1/exchangeInfo`;
+    const endpoint = "/fapi/v1/exchangeInfo";
 
-    try {
-        const response = await http.get(url);
+    const response = await request(
+        {
+            method: "GET",
+            baseURL: FUTURES_BASE_URL,
+            url: endpoint
+        },
+        { endpoint, symbol: normalized }
+    );
 
-        const pair = response.data.symbols.find(item =>
-            item.symbol === normalized &&
-            item.quoteAsset === "USDT" &&
-            item.status === "TRADING"
-        );
+    const pair = response.data.symbols.find(item =>
+        item.symbol === normalized &&
+        item.quoteAsset === "USDT" &&
+        item.status === "TRADING"
+    );
 
-        if (!pair) {
-            return {
-                available: false,
-                symbol: normalized
-            };
-        }
-
+    if (!pair) {
         return {
-            available: true,
-            symbol: pair.symbol,
-            baseAsset: pair.baseAsset,
-            quoteAsset: pair.quoteAsset
+            available: false,
+            symbol: normalized
         };
-    } catch (error) {
-        throw new Error(
-            `Không kiểm tra được Futures ${normalized}: ${getErrorMessage(error)}`
-        );
     }
+
+    return {
+        available: true,
+        symbol: pair.symbol,
+        baseAsset: pair.baseAsset,
+        quoteAsset: pair.quoteAsset
+    };
 }
 
 /**
@@ -139,34 +221,23 @@ async function getFuturesPairInfo(symbol) {
  */
 async function getFuturesPrice(symbol) {
     const normalized = normalizeSymbol(symbol);
+    const endpoint = "/fapi/v1/ticker/price";
 
-    try {
-        const response = await http.get(
-            `${FUTURES_BASE_URL}/fapi/v1/ticker/price`,
-            { params: { symbol: normalized } }
-        );
+    const response = await request(
+        {
+            method: "GET",
+            baseURL: FUTURES_BASE_URL,
+            url: endpoint,
+            params: { symbol: normalized }
+        },
+        { endpoint, symbol: normalized }
+    );
 
-        return Number(response.data.price);
-    } catch (error) {
-        // Không coi lỗi mạng hoặc lỗi API là chắc chắn không có cặp.
-        throw new Error(
-            `Không lấy được giá Futures ${normalized}: ${getErrorMessage(error)}`
-        );
-    }
+    return Number(response.data.price);
 }
 
 function normalizeSymbol(symbol) {
     return String(symbol).trim().toUpperCase();
-}
-
-function getErrorMessage(error) {
-    if (error.response) {
-        return `HTTP ${error.response.status}: ${
-            JSON.stringify(error.response.data)
-        }`;
-    }
-
-    return error.message || "Lỗi không xác định";
 }
 
 module.exports = {

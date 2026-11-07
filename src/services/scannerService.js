@@ -273,7 +273,7 @@ async function scanAllSpotUsdt(options = {}) {
                     result.volRatio >= threshold &&
                     Number.isFinite(result.ema20) &&
                     Number.isFinite(result.ema50) &&
-                    result.ema20 > result.ema50
+                    result.ema20 < result.ema50
                 ) {
                     matches.push(result);
 

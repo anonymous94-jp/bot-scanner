@@ -253,18 +253,38 @@ async function scanAllSpotUsdt(options = {}) {
                     result.change24hPct = ticker.change24hPct;
                 }
 
+                // if (
+                //     Number.isFinite(result.volRatio) &&
+                //     result.volRatio >= threshold
+                // ) {
+                //     matches.push(result);
+
+                //     logger.info("Symbol đạt điều kiện VolRatio", {
+                //         symbol,
+                //         volRatio: result.volRatio,
+                //         threshold,
+                //         rsi14: result.rsi14,
+                //         change15mPct: result.change15mPct
+                //     });
+                // }
+                //update
                 if (
                     Number.isFinite(result.volRatio) &&
-                    result.volRatio >= threshold
+                    result.volRatio >= threshold &&
+                    Number.isFinite(result.ema20) &&
+                    Number.isFinite(result.ema50) &&
+                    result.ema20 > result.ema50
                 ) {
                     matches.push(result);
 
-                    logger.info("Symbol đạt điều kiện VolRatio", {
+                    logger.info("Symbol đạt điều kiện VolRatio + EMA", {
                         symbol,
                         volRatio: result.volRatio,
                         threshold,
+                        ema20: result.ema20,
+                        ema50: result.ema50,
                         rsi14: result.rsi14,
-                        change15mPct: result.change15mPct
+                        change24hPct: result.change24hPct
                     });
                 }
             } catch (error) {
